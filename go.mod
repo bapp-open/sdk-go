@@ -1,3 +1,3 @@
-module github.com/bapp-cloud/sdk-go
+module github.com/bapp-open/sdk-go
 
 go 1.21
