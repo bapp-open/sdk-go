@@ -255,6 +255,143 @@ func (c *Client) Delete(contentType, id string) (map[string]interface{}, error) 
 	return c.do("DELETE", "/content-type/"+contentType+"/"+id+"/", nil, nil, nil)
 }
 
+// DocumentView represents a normalized document view entry extracted from a record.
+type DocumentView struct {
+	Label            string
+	Token            string
+	Type             string // "public_view" or "view_token"
+	Variations       []map[string]interface{}
+	DefaultVariation string
+}
+
+// GetDocumentViews extracts available document views from a record.
+// Works with both public_view (new) and view_token (legacy) formats.
+func GetDocumentViews(record map[string]interface{}) []DocumentView {
+	var views []DocumentView
+
+	if pv, ok := record["public_view"].([]interface{}); ok {
+		for _, item := range pv {
+			entry, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			dv := DocumentView{
+				Type: "public_view",
+			}
+			if s, ok := entry["label"].(string); ok {
+				dv.Label = s
+			}
+			if s, ok := entry["view_token"].(string); ok {
+				dv.Token = s
+			}
+			if vars, ok := entry["variations"].([]interface{}); ok {
+				for _, v := range vars {
+					if m, ok := v.(map[string]interface{}); ok {
+						dv.Variations = append(dv.Variations, m)
+					}
+				}
+			}
+			if s, ok := entry["default_variation"].(string); ok {
+				dv.DefaultVariation = s
+			}
+			views = append(views, dv)
+		}
+	}
+
+	if vt, ok := record["view_token"].([]interface{}); ok {
+		for _, item := range vt {
+			entry, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			dv := DocumentView{
+				Type: "view_token",
+			}
+			if s, ok := entry["label"].(string); ok {
+				dv.Label = s
+			}
+			if s, ok := entry["view_token"].(string); ok {
+				dv.Token = s
+			}
+			views = append(views, dv)
+		}
+	}
+
+	return views
+}
+
+// GetDocumentURL builds a document render/download URL from a record.
+// Prefers public_view when both formats are present.
+//
+//	output: "html", "pdf", "jpg", or "context"
+//	label: select a specific view by label (empty string = first available)
+//	variation: variation code for public_view entries (empty string = use default)
+func (c *Client) GetDocumentURL(record map[string]interface{}, output, label, variation string) string {
+	views := GetDocumentViews(record)
+	if len(views) == 0 {
+		return ""
+	}
+
+	var view *DocumentView
+	if label != "" {
+		for i := range views {
+			if views[i].Label == label {
+				view = &views[i]
+				break
+			}
+		}
+	}
+	if view == nil {
+		view = &views[0]
+	}
+
+	if view.Token == "" {
+		return ""
+	}
+
+	if view.Type == "public_view" {
+		u := fmt.Sprintf("%s/render/%s?output=%s", c.Host, view.Token, output)
+		v := variation
+		if v == "" {
+			v = view.DefaultVariation
+		}
+		if v != "" {
+			u += "&variation=" + v
+		}
+		return u
+	}
+
+	// Legacy view_token
+	action := "pdf.preview"
+	switch output {
+	case "pdf":
+		action = "pdf.download"
+	case "context":
+		action = "pdf.context"
+	}
+	return fmt.Sprintf("%s/documents/%s?token=%s", c.Host, action, view.Token)
+}
+
+// GetDocumentContent fetches document content (PDF, HTML, JPG, etc.) as bytes.
+// Builds the URL via GetDocumentURL and performs a plain GET request.
+// Returns (nil, nil) when the record has no view tokens.
+func (c *Client) GetDocumentContent(record map[string]interface{}, output, label, variation string) ([]byte, error) {
+	u := c.GetDocumentURL(record, output, label, variation)
+	if u == "" {
+		return nil, nil
+	}
+	resp, err := c.http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return io.ReadAll(resp.Body)
+}
+
 // ListTasks returns all available task codes.
 func (c *Client) ListTasks() ([]interface{}, error) {
 	raw, err := c.doRaw("GET", "/tasks", nil, nil, nil)
