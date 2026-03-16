@@ -326,7 +326,8 @@ func GetDocumentViews(record map[string]interface{}) []DocumentView {
 //	output: "html", "pdf", "jpg", or "context"
 //	label: select a specific view by label (empty string = first available)
 //	variation: variation code for public_view entries (empty string = use default)
-func (c *Client) GetDocumentURL(record map[string]interface{}, output, label, variation string) string {
+//	download: when true the response is sent as an attachment
+func (c *Client) GetDocumentURL(record map[string]interface{}, output, label, variation string, download bool) string {
 	views := GetDocumentViews(record)
 	if len(views) == 0 {
 		return ""
@@ -358,16 +359,25 @@ func (c *Client) GetDocumentURL(record map[string]interface{}, output, label, va
 		if v != "" {
 			u += "&variation=" + v
 		}
+		if download {
+			u += "&download=true"
+		}
 		return u
 	}
 
 	// Legacy view_token
-	action := "pdf.preview"
+	var action string
 	switch output {
 	case "pdf":
-		action = "pdf.download"
+		if download {
+			action = "pdf.download"
+		} else {
+			action = "pdf.view"
+		}
 	case "context":
 		action = "pdf.context"
+	default:
+		action = "pdf.preview"
 	}
 	return fmt.Sprintf("%s/documents/%s?token=%s", c.Host, action, view.Token)
 }
@@ -375,8 +385,8 @@ func (c *Client) GetDocumentURL(record map[string]interface{}, output, label, va
 // GetDocumentContent fetches document content (PDF, HTML, JPG, etc.) as bytes.
 // Builds the URL via GetDocumentURL and performs a plain GET request.
 // Returns (nil, nil) when the record has no view tokens.
-func (c *Client) GetDocumentContent(record map[string]interface{}, output, label, variation string) ([]byte, error) {
-	u := c.GetDocumentURL(record, output, label, variation)
+func (c *Client) GetDocumentContent(record map[string]interface{}, output, label, variation string, download bool) ([]byte, error) {
+	u := c.GetDocumentURL(record, output, label, variation, download)
 	if u == "" {
 		return nil, nil
 	}
