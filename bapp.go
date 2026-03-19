@@ -34,6 +34,7 @@ type Client struct {
 	Tenant     string
 	App        string
 	authHeader string
+	userAgent  string
 	http       *http.Client
 }
 
@@ -58,6 +59,11 @@ func WithTenant(id string) Option {
 // WithApp sets the default app slug.
 func WithApp(slug string) Option {
 	return func(c *Client) { c.App = slug }
+}
+
+// WithUserAgent sets a custom User-Agent header.
+func WithUserAgent(ua string) Option {
+	return func(c *Client) { c.userAgent = ua }
 }
 
 // NewClient creates a new BAPP API client.
@@ -131,6 +137,9 @@ func (c *Client) doRaw(method, path string, params url.Values, body interface{},
 		return nil, err
 	}
 
+	if c.userAgent != "" {
+		req.Header.Set("User-Agent", c.userAgent)
+	}
 	if c.authHeader != "" {
 		req.Header.Set("Authorization", c.authHeader)
 	}
