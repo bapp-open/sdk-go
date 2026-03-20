@@ -22,10 +22,10 @@ type File struct {
 
 // PagedList holds the results slice plus pagination metadata.
 type PagedList struct {
-	Results  []map[string]interface{}
-	Count    int
-	Next     string
-	Previous string
+	Results  []map[string]interface{} `json:"results"`
+	Count    int                      `json:"count"`
+	Next     string                   `json:"next"`
+	Previous string                   `json:"previous"`
 }
 
 // Client is a BAPP Auto API client.
