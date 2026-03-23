@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -35,6 +38,7 @@ type Client struct {
 	App        string
 	authHeader string
 	userAgent  string
+	maxRetries int
 	http       *http.Client
 }
 
@@ -66,12 +70,23 @@ func WithUserAgent(ua string) Option {
 	return func(c *Client) { c.userAgent = ua }
 }
 
+// WithTimeout sets the HTTP client timeout.
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) { c.http.Timeout = d }
+}
+
+// WithMaxRetries sets the maximum number of retries on transient errors.
+func WithMaxRetries(n int) Option {
+	return func(c *Client) { c.maxRetries = n }
+}
+
 // NewClient creates a new BAPP API client.
 func NewClient(opts ...Option) *Client {
 	c := &Client{
-		Host: "https://panel.bapp.ro/api",
-		App:  "account",
-		http: &http.Client{},
+		Host:       "https://panel.bapp.ro/api",
+		App:        "account",
+		maxRetries: 3,
+		http:       &http.Client{Timeout: 30 * time.Second},
 	}
 	for _, o := range opts {
 		o(c)
@@ -156,25 +171,50 @@ func (c *Client) doRaw(method, path string, params url.Values, body interface{},
 		req.Header.Set(k, v)
 	}
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < c.maxRetries {
+				backoff := math.Min(math.Pow(2, float64(attempt))+rand.Float64(), 10)
+				time.Sleep(time.Duration(backoff * float64(time.Second)))
+				// Rebuild request for retry (body may have been consumed).
+				req, _ = http.NewRequest(req.Method, req.URL.String(), r)
+				for k, vs := range req.Header {
+					for _, v := range vs {
+						req.Header.Add(k, v)
+					}
+				}
+				continue
+			}
+			return nil, err
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		rb, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(rb))
-	}
-	if resp.StatusCode == 204 {
-		return nil, nil
-	}
+		if (resp.StatusCode == 429 || resp.StatusCode >= 500) && attempt < c.maxRetries {
+			io.ReadAll(resp.Body)
+			resp.Body.Close()
+			backoff := math.Min(math.Pow(2, float64(attempt))+rand.Float64(), 10)
+			time.Sleep(time.Duration(backoff * float64(time.Second)))
+			continue
+		}
 
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			rb, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(rb))
+		}
+		if resp.StatusCode == 204 {
+			return nil, nil
+		}
+
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read response: %w", err)
+		}
+		return json.RawMessage(raw), nil
 	}
-	return json.RawMessage(raw), nil
+	return nil, lastErr
 }
 
 func (c *Client) do(method, path string, params url.Values, body interface{}, extraHeaders map[string]string) (map[string]interface{}, error) {
@@ -360,18 +400,19 @@ func (c *Client) GetDocumentURL(record map[string]interface{}, output, label, va
 	}
 
 	if view.Type == "public_view" {
-		u := fmt.Sprintf("%s/render/%s?output=%s", c.Host, view.Token, output)
+		q := url.Values{}
+		q.Set("output", output)
 		v := variation
 		if v == "" {
 			v = view.DefaultVariation
 		}
 		if v != "" {
-			u += "&variation=" + v
+			q.Set("variation", v)
 		}
 		if download {
-			u += "&download=true"
+			q.Set("download", "true")
 		}
-		return u
+		return fmt.Sprintf("%s/render/%s?%s", c.Host, view.Token, q.Encode())
 	}
 
 	// Legacy view_token
@@ -388,7 +429,9 @@ func (c *Client) GetDocumentURL(record map[string]interface{}, output, label, va
 	default:
 		action = "pdf.preview"
 	}
-	return fmt.Sprintf("%s/documents/%s?token=%s", c.Host, action, view.Token)
+	q := url.Values{}
+	q.Set("token", view.Token)
+	return fmt.Sprintf("%s/documents/%s?%s", c.Host, action, q.Encode())
 }
 
 // GetDocumentContent fetches document content (PDF, HTML, JPG, etc.) as bytes.
@@ -409,6 +452,37 @@ func (c *Client) GetDocumentContent(record map[string]interface{}, output, label
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 	return io.ReadAll(resp.Body)
+}
+
+// DownloadDocument streams document content to w without buffering it in memory.
+// Returns an error when the record has no view tokens.
+func (c *Client) DownloadDocument(record map[string]interface{}, w io.Writer, output, label, variation string, download bool) error {
+	u := c.GetDocumentURL(record, output, label, variation, download)
+	if u == "" {
+		return fmt.Errorf("no document views available")
+	}
+	resp, err := c.http.Get(u)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	_, err = io.Copy(w, resp.Body)
+	return err
+}
+
+// DownloadDocumentToFile is a convenience wrapper around DownloadDocument
+// that writes directly to a file path.
+func (c *Client) DownloadDocumentToFile(record map[string]interface{}, path, output, label, variation string, download bool) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return c.DownloadDocument(record, f, output, label, variation, download)
 }
 
 // ListTasks returns all available task codes.
